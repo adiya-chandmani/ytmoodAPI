@@ -1,0 +1,12 @@
+pytest
+fastapi
+uvicorn
+requests
+python-dotenv
+transformers
+torch
+openai
+redis
+celery
+sqlalchemy
+psycopg2-binary
