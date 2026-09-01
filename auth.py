@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import secrets
+import time
 from typing import Optional
 
 from fastapi import Header, HTTPException
@@ -18,13 +19,37 @@ logger = logging.getLogger("ytmoodapi.auth")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
+# Redis가 없는 환경(무료 호스팅 등)에서 redis-py는 연결 실패마다 백오프를 두고
+# 재시도한다. 그대로 두면 요청 하나가 몇 초씩 서버에서 붙잡힌다. 짧은 타임아웃과
+# 쿨다운을 둬서, 실패한 뒤에는 한동안 아예 시도하지 않는다.
+REDIS_CONNECT_TIMEOUT_SECONDS = float(os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "1"))
+REDIS_RETRY_COOLDOWN_SECONDS = float(os.getenv("REDIS_RETRY_COOLDOWN_SECONDS", "60"))
+
+_redis_unavailable_until = 0.0
+
 # Redis is optional: the client is constructed lazily-connecting, so an
 # unreachable server does not stop the app from booting. If the package or the
 # constructor itself fails we simply run without usage counting.
 try:
     import redis
 
-    redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    _client_kwargs = {
+        "host": REDIS_HOST,
+        "port": REDIS_PORT,
+        "decode_responses": True,
+        "socket_connect_timeout": REDIS_CONNECT_TIMEOUT_SECONDS,
+        "socket_timeout": REDIS_CONNECT_TIMEOUT_SECONDS,
+    }
+    try:
+        from redis.backoff import NoBackoff
+        from redis.retry import Retry
+
+        # 기본 재시도 정책은 백오프를 두고 여러 번 재시도한다. Redis가 아예
+        # 없는 환경에서는 그 대기가 요청마다 몇 초씩 쌓인다.
+        _client_kwargs["retry"] = Retry(NoBackoff(), 0)
+    except Exception:
+        logger.debug("redis retry policy unavailable; using library defaults")
+    redis_client = redis.Redis(**_client_kwargs)
 except Exception:
     logger.warning("Redis client unavailable; usage limiting disabled", exc_info=True)
     redis_client = None
@@ -127,7 +152,11 @@ def check_usage(api_key: str):
     limits = PLAN_LIMITS.get(plan_name)
     if limits is None:
         raise HTTPException(status_code=403, detail="지원하지 않는 플랜")
+    global _redis_unavailable_until
     if redis_client is None:
+        return
+    if time.monotonic() < _redis_unavailable_until:
+        # 최근에 실패했다. 쿨다운이 끝날 때까지 연결을 시도하지 않는다.
         return
     key = f"usage:{api_key}:{plan_name}"
     try:
@@ -137,7 +166,12 @@ def check_usage(api_key: str):
     except Exception as exc:
         # Redis down: serve the request rather than failing it. 요청마다 스택
         # 트레이스를 남기면 로그가 금방 가득 차므로 한 줄만 남긴다.
-        logger.warning("Redis unreachable; skipping usage check: %s", exc)
+        _redis_unavailable_until = time.monotonic() + REDIS_RETRY_COOLDOWN_SECONDS
+        logger.warning(
+            "Redis unreachable; skipping usage checks for %ss: %s",
+            REDIS_RETRY_COOLDOWN_SECONDS,
+            exc,
+        )
         return
     if int(count) > limits["limit"]:
         raise HTTPException(status_code=429, detail=f"{plan_name} 플랜 사용량 초과")
