@@ -49,6 +49,8 @@ def _purge_db(db):
 
 
 def _purge_redis():
+    # 쿨다운이 남아 있으면 뒤따르는 테스트가 Redis를 건너뛴다
+    auth._redis_unavailable_until = 0.0
     if not _redis_available():
         return
     for api_key in ALL_KEYS:
@@ -123,3 +125,34 @@ def test_check_usage_passes_when_redis_unavailable(monkeypatch):
     monkeypatch.setattr(auth, "redis_client", None)
     for _ in range(PLAN_LIMITS["Free"]["limit"] + 10):
         auth.check_usage(FREE_KEY)
+
+
+def test_redis_failure_does_not_slow_every_request(monkeypatch):
+    """
+    배포 환경에서 Redis가 없으면 redis-py가 요청마다 재시도하며 몇 초를 쓴다.
+    한 번 실패한 뒤에는 쿨다운 동안 아예 시도하지 않아야 한다.
+    """
+    import time
+
+    attempts = []
+
+    class _Dead:
+        def incr(self, key):
+            attempts.append(key)
+            time.sleep(0.2)  # 연결 재시도 비용을 흉내낸다
+            raise ConnectionError("Connection refused")
+
+        def expire(self, key, ttl):
+            raise ConnectionError("Connection refused")
+
+    monkeypatch.setattr(auth, "redis_client", _Dead())
+    monkeypatch.setattr(auth, "_redis_unavailable_until", 0.0)
+    monkeypatch.setattr(auth, "REDIS_RETRY_COOLDOWN_SECONDS", 30)
+
+    start = time.monotonic()
+    for _ in range(10):
+        auth.check_usage(FREE_KEY)
+    elapsed = time.monotonic() - start
+
+    assert len(attempts) == 1, f"쿨다운을 무시하고 {len(attempts)}번 연결을 시도했다"
+    assert elapsed < 1.0
