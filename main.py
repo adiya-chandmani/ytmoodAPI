@@ -1,28 +1,34 @@
-from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel
-from comment_collector import collect_comments
-from sentiment_analyzer import analyze_sentiment
-from profanity_detector import detect_profanity
-from keyword_extractor import extract_keywords
-from auth import check_usage, get_plan
-import os
-from collections import Counter
-from db import SessionLocal, Base, engine
-from models import User, ApiKey, seed_plans
-import secrets
-import logging
-
-logger = logging.getLogger("ytmoodapi.main")
-
-app = FastAPI()
-
 """
 main.py: YTmoodAPI FastAPI 진입점
 """
+import json
+import logging
+import os
+import secrets
+from collections import Counter
+from contextlib import asynccontextmanager
+from typing import List, Optional
+
+from fastapi import Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from auth import check_usage, get_plan, require_admin
+from comment_collector import CommentCollectionError, collect_comments
+from db import Base, SessionLocal, engine, get_db
+from keyword_extractor import extract_keywords
+from models import AnalysisResult, ApiKey, Plan, User, seed_plans
+from profanity_detector import detect_profanity
+from sentiment_analyzer import analyze_sentiment
+
+logger = logging.getLogger("ytmoodapi.main")
+
+SENTIMENT_LABELS = ("positive", "neutral", "negative")
+HIGHLIGHT_COUNT = 2
 
 
-@app.on_event("startup")
-def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """배포 환경에는 수동 마이그레이션용 셸이 없으므로 기동 시 자동 초기화한다."""
     try:
         Base.metadata.create_all(bind=engine)
@@ -33,6 +39,31 @@ def on_startup():
             db.close()
     except Exception:
         logger.exception("Startup DB initialization failed")
+    yield
+
+
+app = FastAPI(title="YTmoodAPI", lifespan=lifespan)
+
+
+class AnalyzeRequest(BaseModel):
+    youtube_video_id: str
+    lang: str = "en"
+    api_key: Optional[str] = None
+
+
+class UserCreate(BaseModel):
+    username: str
+    plan_id: int
+
+
+class ApiKeyOut(BaseModel):
+    api_key: str
+
+
+class WhoAmIOut(BaseModel):
+    api_key: str
+    plan: str
+    user_id: Optional[int] = None
 
 
 @app.get("/")
@@ -40,100 +71,144 @@ def on_startup():
 def health():
     return {"status": "ok", "service": "YTMoodAPI"}
 
-class AnalyzeRequest(BaseModel):
-    youtube_video_id: str
-    lang: str = "en"
-    api_key: str = None
 
-class UserCreate(BaseModel):
-    username: str
-    plan_id: int
-
-class ApiKeyOut(BaseModel):
-    api_key: str
-
-def summarize(comments):
+def summarize(comments: List[str]) -> dict:
+    # 댓글마다 감정 분석을 한 번만 수행한다. 예전에는 요약/긍정/부정 구간에서
+    # 각각 다시 호출해 댓글 수의 3배만큼 추론이 돌았다.
     sentiments = [analyze_sentiment(c) for c in comments]
     total = len(sentiments) or 1
+    counts = Counter(sentiments)
     summary = {
-        "positive": int(sentiments.count("positive") * 100 / total),
-        "neutral": int(sentiments.count("neutral") * 100 / total) if "neutral" in sentiments else 0,
-        "negative": int(sentiments.count("negative") * 100 / total)
+        label: int(counts[label] * 100 / total) for label in SENTIMENT_LABELS
     }
-    highlighted_comments = {
-        "positive": [c for c in comments if analyze_sentiment(c) == "positive"][:2],
-        "negative": [c for c in comments if analyze_sentiment(c) == "negative"][:2]
+    highlighted = {
+        label: [c for c, s in zip(comments, sentiments) if s == label][:HIGHLIGHT_COUNT]
+        for label in ("positive", "negative")
     }
-    keywords = extract_keywords(comments)
     return {
         "summary": summary,
-        "keywords": keywords,
-        "highlighted_comments": highlighted_comments
+        "keywords": extract_keywords(comments),
+        "highlighted_comments": highlighted,
+        "profanity_count": sum(1 for c in comments if detect_profanity(c)),
     }
 
+
+def _store_result(db: Session, api_key: str, video_id: str, result: dict) -> None:
+    """분석 결과를 보관한다. 실패해도 응답은 정상 반환한다."""
+    try:
+        key_row = db.query(ApiKey).filter_by(key=api_key).first()
+        db.add(
+            AnalysisResult(
+                user_id=key_row.user_id if key_row else None,
+                video_id=video_id,
+                result_json=json.dumps(result, ensure_ascii=False),
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to store analysis result")
+
+
 @app.post("/analyze-comments")
-def analyze_comments(req: AnalyzeRequest):
-    api_key = req.api_key or os.getenv("YOUTUBE_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="API 키가 필요합니다.")
-    check_usage(api_key)
-    comments = collect_comments(req.youtube_video_id, api_key)
+def analyze_comments(
+    req: AnalyzeRequest,
+    x_api_key: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    # 호출자 키(요금제/사용량)와 YouTube Data API 키는 서로 다른 것이다.
+    # 예전에는 하나의 값을 양쪽에 모두 써서, RapidAPI 구독자 키로는 댓글을
+    # 가져올 수 없었고 반대로 서버 키가 사용자로 등록되기도 했다.
+    client_key = req.api_key or x_api_key
+    if not client_key:
+        raise HTTPException(status_code=401, detail="API 키가 필요합니다.")
+    check_usage(client_key)
+
+    youtube_key = os.getenv("YOUTUBE_API_KEY")
+    if not youtube_key:
+        raise HTTPException(
+            status_code=503, detail="서버에 YOUTUBE_API_KEY가 설정되지 않았습니다."
+        )
+
+    try:
+        comments = collect_comments(req.youtube_video_id, youtube_key)
+    except CommentCollectionError as exc:
+        # 수집 실패를 '댓글 0개'로 위장하지 않는다
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     result = summarize(comments)
-    result["plan"] = get_plan(api_key)
+    result["plan"] = get_plan(client_key)
+    _store_result(db, client_key, req.youtube_video_id, result)
     return result
 
-# 추후 요약/대표댓글/비율 등 추가 예정 
 
-# 회원가입
+# 내 API 키/플랜 조회 (호출자 본인의 키 기준)
+@app.get("/apikeys/me", response_model=WhoAmIOut)
+def get_my_apikey(
+    x_api_key: Optional[str] = Header(None), db: Session = Depends(get_db)
+):
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="X-API-Key 헤더가 필요합니다")
+    # get_plan이 미등록 키를 먼저 등록하므로, 그 뒤에 조회해야 user_id가 채워진다
+    plan = get_plan(x_api_key)
+    key_row = db.query(ApiKey).filter_by(key=x_api_key).first()
+    return {
+        "api_key": x_api_key,
+        "plan": plan,
+        "user_id": key_row.user_id if key_row else None,
+    }
+
+
+# --- 관리자 전용 --------------------------------------------------------------
+# 아래 엔드포인트는 키 발급/열람/삭제가 가능하므로 전부 관리자 인증을 요구한다.
+
+
 @app.post("/users", response_model=dict)
-def create_user(user: UserCreate):
-    db = SessionLocal()
+def create_user(
+    user: UserCreate,
+    db: Session = Depends(get_db),
+    _admin: str = Depends(require_admin),
+):
+    if not db.query(Plan).filter_by(id=user.plan_id).first():
+        raise HTTPException(status_code=400, detail="존재하지 않는 plan_id")
     db_user = User(username=user.username, plan_id=user.plan_id)
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
-    db.close()
     return {"user_id": db_user.id}
 
-# API 키 발급
+
 @app.post("/apikeys", response_model=ApiKeyOut)
-def create_apikey(user_id: int):
-    db = SessionLocal()
-    key = secrets.token_urlsafe(32)
-    api_key = ApiKey(key=key, user_id=user_id)
+def create_apikey(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _admin: str = Depends(require_admin),
+):
+    if not db.query(User).filter_by(id=user_id).first():
+        raise HTTPException(status_code=404, detail="존재하지 않는 user_id")
+    api_key = ApiKey(key=secrets.token_urlsafe(32), user_id=user_id)
     db.add(api_key)
     db.commit()
     db.refresh(api_key)
-    db.close()
     return {"api_key": api_key.key}
 
-# 내 API 키 조회
-@app.get("/apikeys/me", response_model=ApiKeyOut)
-def get_my_apikey(user_id: int):
-    db = SessionLocal()
-    api_key = db.query(ApiKey).filter_by(user_id=user_id).first()
-    db.close()
-    if not api_key:
-        raise HTTPException(status_code=404, detail="API key not found")
-    return {"api_key": api_key.key}
 
-# (관리자) 전체 키 조회
 @app.get("/apikeys", response_model=list)
-def list_apikeys():
-    db = SessionLocal()
-    keys = db.query(ApiKey).all()
-    db.close()
-    return [{"api_key": k.key, "user_id": k.user_id} for k in keys]
+def list_apikeys(
+    db: Session = Depends(get_db), _admin: str = Depends(require_admin)
+):
+    return [
+        {"api_key": k.key, "user_id": k.user_id} for k in db.query(ApiKey).all()
+    ]
 
-# (관리자) 키 삭제
+
 @app.delete("/apikeys/{key}", response_model=dict)
-def delete_apikey(key: str):
-    db = SessionLocal()
+def delete_apikey(
+    key: str, db: Session = Depends(get_db), _admin: str = Depends(require_admin)
+):
     api_key = db.query(ApiKey).filter_by(key=key).first()
     if not api_key:
-        db.close()
         raise HTTPException(status_code=404, detail="API key not found")
     db.delete(api_key)
     db.commit()
-    db.close()
-    return {"deleted": key} 
+    return {"deleted": key}

@@ -1,15 +1,20 @@
-version: '3.8'
 services:
   app:
     build: .
     container_name: ytmoodapi_app
     ports:
       - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://ytmood:ytmoodpw@db:5432/ytmood
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
     env_file:
       - .env
     depends_on:
-      - redis
-      - db
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
   redis:
     image: redis:7
     container_name: ytmoodapi_redis
@@ -26,5 +31,10 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ytmood"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 volumes:
-  pgdata: 
+  pgdata:

@@ -4,12 +4,14 @@ auth.py: 인증 및 요금제 로직 (Redis 기반 카운팅)
 import hashlib
 import logging
 import os
+import secrets
+from typing import Optional
 
-from fastapi import HTTPException
+from fastapi import Header, HTTPException
 from sqlalchemy.exc import IntegrityError
 
 from db import SessionLocal
-from models import User, ApiKey, Plan, seed_plans
+from models import ApiKey, Plan, User, seed_plans
 
 logger = logging.getLogger("ytmoodapi.auth")
 
@@ -28,9 +30,10 @@ except Exception:
     redis_client = None
 
 DEFAULT_PLAN_NAME = "Free"
+ADMIN_PLAN_NAME = "Admin"
 
 
-def _get_or_create_plan(db, name: str) -> Plan:
+def _get_or_create_plan(db, name: str) -> Optional[Plan]:
     plan = db.query(Plan).filter_by(name=name).first()
     if plan:
         return plan
@@ -61,18 +64,52 @@ def _provision(db, api_key: str) -> str:
     return plan.name
 
 
-# DB에서 api_key로 요금제 이름 반환 (없는 키는 Free 플랜으로 자동 등록)
-def get_plan(api_key: str) -> str:
+def lookup_plan(api_key: str) -> Optional[str]:
+    """등록된 키의 요금제 이름. 등록되지 않은 키면 None (자동 등록하지 않는다)."""
+    if not api_key:
+        return None
     db = SessionLocal()
     try:
         api_key_obj = db.query(ApiKey).filter_by(key=api_key).first()
         if api_key_obj is None:
-            return _provision(db, api_key)
+            return None
         if api_key_obj.user and api_key_obj.user.plan:
             return api_key_obj.user.plan.name
         return DEFAULT_PLAN_NAME
     finally:
         db.close()
+
+
+# DB에서 api_key로 요금제 이름 반환 (없는 키는 Free 플랜으로 자동 등록)
+def get_plan(api_key: str) -> str:
+    plan_name = lookup_plan(api_key)
+    if plan_name is not None:
+        return plan_name
+    db = SessionLocal()
+    try:
+        # 조회와 등록 사이에 다른 요청이 먼저 등록했을 수 있으므로 한 번 더 확인한다
+        if db.query(ApiKey).filter_by(key=api_key).first():
+            return lookup_plan(api_key) or DEFAULT_PLAN_NAME
+        return _provision(db, api_key)
+    finally:
+        db.close()
+
+
+def require_admin(x_api_key: Optional[str] = Header(None)) -> str:
+    """
+    관리자 전용 엔드포인트 의존성.
+
+    ADMIN_API_KEY 환경변수와 일치하거나, DB에서 Admin 플랜으로 등록된 키만 통과.
+    미등록 키를 Free로 자동 등록해버리지 않도록 get_plan이 아니라 lookup_plan을 쓴다.
+    """
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="X-API-Key 헤더가 필요합니다")
+    admin_key = os.getenv("ADMIN_API_KEY")
+    if admin_key and secrets.compare_digest(x_api_key, admin_key):
+        return x_api_key
+    if lookup_plan(x_api_key) == ADMIN_PLAN_NAME:
+        return x_api_key
+    raise HTTPException(status_code=403, detail="관리자 권한이 필요합니다")
 
 
 # DB에서 요금제 정보로 Redis 카운팅
@@ -97,9 +134,10 @@ def check_usage(api_key: str):
         count = redis_client.incr(key)
         if count == 1:
             redis_client.expire(key, limits["period"])
-    except Exception:
-        # Redis down: serve the request rather than failing it
-        logger.warning("Redis unreachable; skipping usage check", exc_info=True)
+    except Exception as exc:
+        # Redis down: serve the request rather than failing it. 요청마다 스택
+        # 트레이스를 남기면 로그가 금방 가득 차므로 한 줄만 남긴다.
+        logger.warning("Redis unreachable; skipping usage check: %s", exc)
         return
     if int(count) > limits["limit"]:
         raise HTTPException(status_code=429, detail=f"{plan_name} 플랜 사용량 초과")

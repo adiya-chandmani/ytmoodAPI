@@ -18,3 +18,12 @@ if DATABASE_URL.startswith("postgres://"):
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+
+def get_db():
+    """FastAPI 의존성: 요청이 끝나면 예외 여부와 무관하게 세션을 닫는다."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

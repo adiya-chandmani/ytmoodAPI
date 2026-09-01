@@ -3,17 +3,33 @@
 유튜브 댓글 감정 분석/요약 API 백엔드
 
 ## 기술 스택
-- Python, FastAPI, Redis/Celery, HuggingFace Transformers, OpenAI API, OAuth 2.0, RapidAPI 배포
+- Python, FastAPI, PostgreSQL(SQLAlchemy), Redis(선택), HuggingFace Transformers
+
+Redis가 없으면 사용량 제한 없이 동작하고, transformers/torch를 불러오지 못하면
+사전 기반 폴백으로 감정을 분석한다. 둘 다 앱 기동을 막지 않는다.
 
 ## 주요 구조
-- main.py: FastAPI 진입점
-- comment_collector.py: 유튜브 댓글 수집
-- sentiment_analyzer.py: 감정 분석
-- profanity_detector.py: 욕설 감지
-- keyword_extractor.py: 키워드 추출
-- auth.py: 인증/요금제 로직
-- tests/: 테스트 코드
+- `main.py`: FastAPI 진입점
+- `comment_collector.py`: 유튜브 댓글 수집
+- `sentiment_analyzer.py`: 감정 분석 (지연 로딩 + 사전 폴백)
+- `profanity_detector.py`: 욕설 감지
+- `keyword_extractor.py`: 키워드 추출 (한국어/영어)
+- `auth.py`: 인증/요금제 로직
+- `db.py`, `models.py`: DB 연결과 스키마
+- `test_*.py`: 저장소 루트의 테스트 코드
 
+## API 키 두 종류
+
+혼동하기 쉬우므로 분리해서 관리한다.
+
+| 키 | 위치 | 용도 |
+|---|---|---|
+| `YOUTUBE_API_KEY` | 서버 환경변수 | YouTube Data API 호출. 클라이언트가 보내지 않는다. |
+| 호출자 키 | 요청의 `X-API-Key` 헤더 또는 본문 `api_key` | 요금제 판별과 사용량 카운팅 |
+| `ADMIN_API_KEY` | 서버 환경변수 | 관리자 엔드포인트 접근 |
+
+처음 보는 호출자 키는 401이 아니라 Free 플랜으로 자동 등록된다. RapidAPI
+구독자가 사전에 가입 절차를 밟을 수 없기 때문이다.
 
 ## API 사용 예시
 
@@ -36,112 +52,85 @@
     "positive": ["진짜 잘했어요!", "계속 보고 싶어요!"],
     "negative": ["내용이 너무 지루해요", "이건 좀 별로네요"]
   },
+  "profanity_count": 0,
   "plan": "Free"
 }
 ```
 
+| 상태 코드 | 의미 |
+|---|---|
+| 401 | 호출자 키 없음 |
+| 429 | 요금제 사용량 초과 |
+| 502 | 유튜브에서 댓글을 가져오지 못함 (키 오류, 할당량 초과 등) |
+| 503 | 서버에 `YOUTUBE_API_KEY` 미설정 |
+
+### 내 키/플랜 조회
+- **GET** `/apikeys/me` — `X-API-Key` 헤더의 키를 기준으로 조회한다
+
+### 헬스 체크
+- **GET** `/health`, **GET** `/` — `{"status": "ok", "service": "YTMoodAPI"}`
+
+### 관리자 전용
+`X-API-Key` 헤더에 `ADMIN_API_KEY` 값 또는 Admin 플랜 키가 필요하다.
+
+- **POST** `/users` — 사용자 생성
+- **POST** `/apikeys?user_id=<id>` — 키 발급
+- **GET** `/apikeys` — 전체 키 조회
+- **DELETE** `/apikeys/{key}` — 키 삭제
+
 ## 환경변수 설정
-- .env 파일에 YOUTUBE_API_KEY 등 주요 키를 설정
+`.env.example`을 복사해 `.env`를 만든다. `DATABASE_URL`이 있으면 그것을 쓰고,
+없으면 `POSTGRES_*` 값을 조합한다.
 
 ## 테스트 실행
 ```bash
-pytest tests/
-``` 
+PYTHONPATH=. pytest
+```
+PostgreSQL이 필요하다. Redis가 없으면 사용량 관련 테스트는 자동으로 건너뛴다.
 
-## 배포 및 피드백
-
-### RapidAPI 배포 방법
-- RapidAPI에 회원가입 후, 새 API 프로젝트 생성
-- main.py의 FastAPI 앱을 Uvicorn 등으로 실행 후, RapidAPI에서 엔드포인트 등록
-- RapidAPI 대시보드에서 테스트 및 문서화 진행
-- 예시: https://rapidapi.com/your-username/api/ytmoodapi
-
-### 주요 엔드포인트
-- POST /analyze-comments: 유튜브 댓글 분석 및 요약
-
-### 피드백/이슈 기록 예시
-- [2025-07-17] MVP 런칭, 첫 사용자 피드백 수집 시작
-- [2025-07-18] Free 플랜 일일 제한 관련 문의 다수 접수
-
-### 프로젝트 마무리
-- 모든 기능 및 문서화, 테스트 완료
-- 추가 피드백 및 개선 요청은 이슈 트래커 또는 RapidAPI 피드백 기능 활용 
+**주의:** 테스트는 `DATABASE_URL`이 가리키는 DB에 직접 쓴다. 운영 DB를 가리킨
+채로 실행하지 말 것.
 
 ## Docker 개발환경
 
 ### 준비물
-- Docker, Docker Compose 설치
+- Docker, Docker Compose
 
-### 환경변수 설정
-- .env 파일을 .env.example 참고해 작성
-
-### 컨테이너 실행
+### 실행
 ```bash
+cp .env.example .env   # YOUTUBE_API_KEY, ADMIN_API_KEY 채우기
 docker-compose up --build
 ```
-- FastAPI: http://localhost:8000
+- FastAPI: http://localhost:8000 (문서: http://localhost:8000/docs)
 - Redis: localhost:6379
 - PostgreSQL: localhost:5432
 
-### 컨테이너 중지
+### 중지
 ```bash
 docker-compose down
 ```
 
-### 컨테이너 내부 접속 예시
-```bash
-docker exec -it ytmoodapi_app /bin/bash
-```
+## DB 초기화
 
-### 기타
-- Redis/PostgreSQL 연동은 환경변수로 자동 연결
-- FastAPI 앱은 0.0.0.0:8000에서 기동
-- DB 마이그레이션/초기화는 추후 안내 
-
-## PostgreSQL 연동
-
-### DB 테이블 생성 (마이그레이션)
-```bash
-# 컨테이너 내부 진입
-# docker exec -it ytmoodapi_app /bin/bash
-# Python 셸에서 아래 실행
-python
->>> from db import Base, engine
->>> import models
->>> Base.metadata.create_all(bind=engine)
-```
+수동 마이그레이션은 필요 없다. 앱이 기동할 때 `Base.metadata.create_all`로
+테이블을 만들고 기본 플랜(Free/Pro/Business/Admin)을 심는다.
 
 ### 주요 테이블/모델
-- User, Plan, ApiKey, AnalysisResult (models.py 참고)
+`User`, `Plan`, `ApiKey`, `AnalysisResult` (`models.py` 참고).
+분석 결과는 `analysis_results`에 자동으로 쌓인다.
 
-### DB CRUD 예시 (Python)
-```python
-from db import SessionLocal
-from models import User
+## 배포
 
-db = SessionLocal()
-user = User(username="testuser", plan_id=1)
-db.add(user)
-db.commit()
-db.refresh(user)
-print(user.id)
-db.close()
-```
+### Render
+저장소 루트의 `render.yaml`이 웹 서비스와 PostgreSQL을 함께 프로비저닝한다.
+`DATABASE_URL`은 DB에서 자동 연결되고, `YOUTUBE_API_KEY`와 `ADMIN_API_KEY`는
+대시보드에서 직접 입력한다.
 
-### SQLAlchemy 공식 문서
-- https://docs.sqlalchemy.org/ 
+### RapidAPI
+- 배포된 URL을 RapidAPI에 엔드포인트로 등록
+- 구독자 키는 `X-API-Key` 헤더로 전달되며 첫 호출 때 Free 플랜으로 등록된다
 
-## 운영 자동화 및 통합 테스트
-
-### 전체 기능 통합 테스트
-- 모든 컨테이너가 실행 중일 때 아래 명령어로 전체 테스트 실행
-```bash
-PYTHONPATH=. pytest
-```
-- 각 기능별 테스트 코드가 통합적으로 실행됨
-
-### CI/CD 예시 (GitHub Actions)
-- .github/workflows/ci.yml 파일 예시:
+### CI (GitHub Actions 예시)
 ```yaml
 name: CI
 on: [push, pull_request]
@@ -156,26 +145,23 @@ jobs:
           POSTGRES_PASSWORD: ytmoodpw
           POSTGRES_DB: ytmood
         ports: [5432:5432]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
       redis:
         image: redis:7
         ports: [6379:6379]
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-      - name: Run tests
-        run: |
-          PYTHONPATH=. pytest
+      - run: pip install -r requirements.txt
+      - run: PYTHONPATH=. pytest
+        env:
+          DATABASE_URL: postgresql://ytmood:ytmoodpw@localhost:5432/ytmood
 ```
 
-### 환경변수/시크릿 관리
-- .env.example 참고, 실제 운영 환경에서는 시크릿/환경변수로 관리
-
-### 보안 점검
-- DB/Redis 비밀번호, API 키 등은 코드에 하드코딩하지 않고 환경변수로만 관리
-- 운영 환경에서는 DEBUG/개발 옵션 비활성화 
+## 보안
+- DB/Redis 비밀번호, API 키는 코드에 하드코딩하지 않고 환경변수로만 관리
+- `ADMIN_API_KEY`를 설정하지 않으면 관리자 엔드포인트는 Admin 플랜 키로만 접근 가능
