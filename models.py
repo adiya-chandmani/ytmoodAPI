@@ -40,6 +40,7 @@ def seed_plans(db):
         Plan(id=1, name="Free"),
         Plan(id=2, name="Pro"),
         Plan(id=3, name="Business"),
+        Plan(id=4, name="Mega"),
         Plan(id=99, name="Admin")
     ]
     for plan in plans:
