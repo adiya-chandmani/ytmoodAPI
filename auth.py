@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 
 from db import SessionLocal
-from models import User, ApiKey, Plan
+from models import User, ApiKey, Plan, seed_plans
 
 logger = logging.getLogger("ytmoodapi.auth")
 
@@ -34,20 +34,20 @@ def _get_or_create_plan(db, name: str) -> Plan:
     plan = db.query(Plan).filter_by(name=name).first()
     if plan:
         return plan
-    plan = Plan(name=name)
-    db.add(plan)
+    # seed_plans assigns explicit ids, which leaves plans_id_seq behind; inserting
+    # an id-less Plan here would collide with it. Re-run the idempotent seeder.
     try:
-        db.commit()
+        seed_plans(db)
     except IntegrityError:
-        # another worker seeded it first
         db.rollback()
-        plan = db.query(Plan).filter_by(name=name).first()
-    return plan
+    return db.query(Plan).filter_by(name=name).first()
 
 
 def _provision(db, api_key: str) -> str:
     """Register an unknown API key under the Free plan and return the plan name."""
     plan = _get_or_create_plan(db, DEFAULT_PLAN_NAME)
+    if plan is None:
+        raise HTTPException(status_code=503, detail="플랜 정보를 초기화하지 못했습니다")
     username = "auto_" + hashlib.sha256(api_key.encode()).hexdigest()[:32]
     user = User(username=username, plan_id=plan.id)
     db.add(user)
