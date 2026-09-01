@@ -7,15 +7,38 @@ from keyword_extractor import extract_keywords
 from auth import check_usage, get_plan
 import os
 from collections import Counter
-from db import SessionLocal
-from models import User, ApiKey
+from db import SessionLocal, Base, engine
+from models import User, ApiKey, seed_plans
 import secrets
+import logging
+
+logger = logging.getLogger("ytmoodapi.main")
 
 app = FastAPI()
 
 """
 main.py: YTmoodAPI FastAPI 진입점
 """
+
+
+@app.on_event("startup")
+def on_startup():
+    """배포 환경에는 수동 마이그레이션용 셸이 없으므로 기동 시 자동 초기화한다."""
+    try:
+        Base.metadata.create_all(bind=engine)
+        db = SessionLocal()
+        try:
+            seed_plans(db)
+        finally:
+            db.close()
+    except Exception:
+        logger.exception("Startup DB initialization failed")
+
+
+@app.get("/")
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "YTMoodAPI"}
 
 class AnalyzeRequest(BaseModel):
     youtube_video_id: str

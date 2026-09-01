@@ -1,0 +1,22 @@
+# Render Blueprint: web service + Postgres in one provisioning step.
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: ytmoodapi
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ytmoodapi-db
+          property: connectionString
+      - key: YOUTUBE_API_KEY
+        sync: false
+
+databases:
+  - name: ytmoodapi-db
+    plan: free
+    databaseName: ytmood
+    user: ytmood
