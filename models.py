@@ -27,10 +27,13 @@ class ApiKey(Base):
 class AnalysisResult(Base):
     __tablename__ = "analysis_results"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"))
     video_id = Column(String, index=True)
     result_json = Column(Text)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
 
 def seed_plans(db):
     plans = [

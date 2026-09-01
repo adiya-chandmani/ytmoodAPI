@@ -43,10 +43,12 @@ def _load_model():
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
         return tokenizer, model, torch
-    except Exception:
+    except Exception as exc:
+        # 최초 1회만 실행되므로 원인 파악을 위해 트레이스를 남긴다
         logger.warning(
-            "Transformer model unavailable; using lexicon fallback", exc_info=True
+            "Transformer model unavailable (%s); using lexicon fallback", exc
         )
+        logger.debug("model load failure", exc_info=True)
         return None
 
 
@@ -82,6 +84,6 @@ def analyze_sentiment(comment: str) -> str:
             probs = torch.softmax(outputs.logits, dim=1)
             label = torch.argmax(probs, dim=1).item()
         return LABELS[label]
-    except Exception:
-        logger.warning("Inference failed; using lexicon fallback", exc_info=True)
+    except Exception as exc:
+        logger.warning("Inference failed (%s); using lexicon fallback", exc)
         return _lexicon_sentiment(comment)
