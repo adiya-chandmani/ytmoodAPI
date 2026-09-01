@@ -9,11 +9,11 @@ from collections import Counter
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from auth import check_usage, get_plan, require_admin
+from auth import Caller, check_usage, get_plan, require_admin, resolve_caller
 from comment_collector import CommentCollectionError, collect_comments
 from db import Base, SessionLocal, engine, get_db
 from keyword_extractor import extract_keywords
@@ -113,16 +113,19 @@ def _store_result(db: Session, api_key: str, video_id: str, result: dict) -> Non
 @app.post("/analyze-comments")
 def analyze_comments(
     req: AnalyzeRequest,
-    x_api_key: Optional[str] = Header(None),
+    caller: Optional[Caller] = Depends(resolve_caller),
     db: Session = Depends(get_db),
 ):
     # 호출자 키(요금제/사용량)와 YouTube Data API 키는 서로 다른 것이다.
     # 예전에는 하나의 값을 양쪽에 모두 써서, RapidAPI 구독자 키로는 댓글을
     # 가져올 수 없었고 반대로 서버 키가 사용자로 등록되기도 했다.
-    client_key = req.api_key or x_api_key
-    if not client_key:
+    # 헤더로 신원을 못 찾으면 본문의 api_key로 넘어간다(직접 호출용).
+    if caller is None and req.api_key:
+        caller = Caller(api_key=req.api_key)
+    if caller is None:
         raise HTTPException(status_code=401, detail="API 키가 필요합니다.")
-    check_usage(client_key)
+    client_key = caller.api_key
+    plan = check_usage(client_key, caller.plan, caller.username)
 
     youtube_key = os.getenv("YOUTUBE_API_KEY")
     if not youtube_key:
@@ -137,7 +140,7 @@ def analyze_comments(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     result = summarize(comments)
-    result["plan"] = get_plan(client_key)
+    result["plan"] = plan
     _store_result(db, client_key, req.youtube_video_id, result)
     return result
 
@@ -145,15 +148,18 @@ def analyze_comments(
 # 내 API 키/플랜 조회 (호출자 본인의 키 기준)
 @app.get("/apikeys/me", response_model=WhoAmIOut)
 def get_my_apikey(
-    x_api_key: Optional[str] = Header(None), db: Session = Depends(get_db)
+    caller: Optional[Caller] = Depends(resolve_caller),
+    db: Session = Depends(get_db),
 ):
-    if not x_api_key:
-        raise HTTPException(status_code=401, detail="X-API-Key 헤더가 필요합니다")
+    if caller is None:
+        raise HTTPException(
+            status_code=401, detail="X-RapidAPI-Key 또는 X-API-Key 헤더가 필요합니다"
+        )
     # get_plan이 미등록 키를 먼저 등록하므로, 그 뒤에 조회해야 user_id가 채워진다
-    plan = get_plan(x_api_key)
-    key_row = db.query(ApiKey).filter_by(key=x_api_key).first()
+    plan = get_plan(caller.api_key, caller.plan, caller.username)
+    key_row = db.query(ApiKey).filter_by(key=caller.api_key).first()
     return {
-        "api_key": x_api_key,
+        "api_key": caller.api_key,
         "plan": plan,
         "user_id": key_row.user_id if key_row else None,
     }
